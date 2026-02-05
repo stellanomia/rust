@@ -9,14 +9,14 @@
 
 //! This program implements a rustc driver that retrieves MIR bodies with
 //! borrowck information. This cannot be done in a straightforward way because
-//! `get_bodies_with_borrowck_facts`–the function for retrieving MIR bodies with
-//! borrowck facts–can panic if the bodies are stolen before it is invoked.
-//! Therefore, the driver overrides `mir_borrowck` query (this is done in the
-//! `config` callback), which retrieves the bodies that are about to be borrow
-//! checked and stores them in a thread local `MIR_BODIES`. Then, `after_analysis`
-//! callback triggers borrow checking of all MIR bodies by retrieving
-//! `optimized_mir` and pulls out the MIR bodies with the borrowck information
-//! from the thread local storage.
+//! accessing MIR bodies directly (e.g. via `get_bodies_with_borrowck_facts`)
+//! can panic if the bodies are stolen during the compilation.
+//!
+//! Therefore, the driver overrides the `mir_borrowck` query. Inside the override,
+//! it uses `mir_borrowck_with_facts` to compute both the Polonius facts and the
+//! standard borrow check result in a single pass. The facts are stored in a
+//! thread local `MIR_BODIES` for later retrieval, while the standard result is
+//! returned to the compiler to continue the compilation.
 
 extern crate rustc_borrowck;
 extern crate rustc_data_structures;
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::thread_local;
 
-use rustc_borrowck::consumers::{self, BodyWithBorrowckFacts, ConsumerOptions};
+use rustc_borrowck::consumers::{self, BodyWithBorrowckFacts, BorrowckResultWithFacts, ConsumerOptions};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_driver::Compilation;
 use rustc_hir::def::DefKind;
@@ -131,20 +131,20 @@ thread_local! {
 
 fn mir_borrowck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'tcx> {
     let opts = ConsumerOptions::PoloniusInputFacts;
-    let bodies_with_facts = consumers::get_bodies_with_borrowck_facts(tcx, def_id, opts);
+    let BorrowckResultWithFacts { borrowck_result, bodies_with_facts, .. } = consumers::mir_borrowck_with_facts(tcx, def_id, opts)?;
+
     // SAFETY: The reader casts the 'static lifetime to 'tcx before using it.
     let bodies_with_facts: FxHashMap<LocalDefId, BodyWithBorrowckFacts<'static>> =
         unsafe { std::mem::transmute(bodies_with_facts) };
+
     MIR_BODIES.with(|state| {
         let mut map = state.borrow_mut();
         for (def_id, body_with_facts) in bodies_with_facts {
             assert!(map.insert(def_id, body_with_facts).is_none());
         }
     });
-    let mut providers = Providers::default();
-    rustc_borrowck::provide(&mut providers.queries);
-    let original_mir_borrowck = providers.queries.mir_borrowck;
-    original_mir_borrowck(tcx, def_id)
+
+    Ok(borrowck_result)
 }
 
 /// Pull MIR bodies stored in the thread-local.

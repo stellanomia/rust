@@ -1,11 +1,13 @@
 //! This file provides API for compiler consumers.
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::IndexVec;
-use rustc_middle::bug;
 use rustc_middle::mir::{Body, Promoted};
 use rustc_middle::ty::TyCtxt;
+use rustc_middle::{bug, ty};
+use rustc_span::ErrorGuaranteed;
+use tracing::debug;
 
 pub use super::borrow_set::{BorrowData, BorrowSet, TwoPhaseActivation};
 pub use super::constraints::OutlivesConstraint;
@@ -105,6 +107,18 @@ pub struct BodyWithBorrowckFacts<'tcx> {
     pub output_facts: Option<Box<PoloniusOutput>>,
 }
 
+/// The result of a borrowck pass that computed facts.
+///
+/// This structure bundles the standard borrow checking result
+/// with the Polonius facts (needed for external analysis).
+pub struct BorrowckResultWithFacts<'tcx> {
+    /// The standard result of the `mir_borrowck` query.
+    pub borrowck_result: &'tcx FxIndexMap<LocalDefId, ty::DefinitionSiteHiddenType<'tcx>>,
+
+    /// The bodies with collected facts.
+    pub bodies_with_facts: FxHashMap<LocalDefId, BodyWithBorrowckFacts<'tcx>>,
+}
+
 /// This function computes borrowck facts for the given def id and all its nested bodies.
 /// It must be called with a typeck root which will then borrowck all nested bodies as well.
 /// The [`ConsumerOptions`] determine which facts are returned. This function makes a copy
@@ -129,4 +143,60 @@ pub fn get_bodies_with_borrowck_facts(
         BorrowCheckRootCtxt::new(tcx, root_def_id, Some(BorrowckConsumer::new(options)));
     root_cx.do_mir_borrowck();
     root_cx.consumer.unwrap().bodies
+}
+
+/// This function computes borrowck facts for the given def id and all its nested bodies,
+/// similar to [`get_bodies_with_borrowck_facts`], but it also returns the standard
+/// borrow check result.
+///
+/// It must be called with a typeck root which will then borrowck all nested bodies as well.
+/// The [`ConsumerOptions`] determine which facts are returned.
+///
+/// This function makes a copy of the bodies because it needs to regenerate the region
+/// identifiers. It should never be invoked during a typical compilation session due to
+/// the unnecessary overhead of returning [`BodyWithBorrowckFacts`].
+///
+/// The primary use case for this function is when a consumer needs to extract Polonius
+/// facts and continue the compilation process.
+///
+/// If you only need the facts and do not require the standard borrow check result
+/// (e.g., for a standalone analysis tool that stops after inspection), consider using
+/// [`get_bodies_with_borrowck_facts`] instead to avoid the overhead of finalization.
+///
+/// Note:
+/// *   This function will panic if the required bodies were already stolen. This
+///     can, for example, happen when requesting a body of a `const` function
+///     because they are evaluated during typechecking.
+///
+/// *   Polonius is highly unstable, so expect regular changes in its signature or other details.
+pub fn mir_borrowck_with_facts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    root_def_id: LocalDefId,
+    options: ConsumerOptions,
+) -> Result<BorrowckResultWithFacts<'tcx>, ErrorGuaranteed> {
+    assert!(!tcx.is_typeck_child(root_def_id.to_def_id()));
+    let (input_body, _) = tcx.mir_promoted(root_def_id);
+    debug!("run mir_borrowck_with_facts: {}", tcx.def_path_str(root_def_id));
+
+    let input_body: &Body<'_> = &input_body.borrow();
+    if let Some(guar) = input_body.tainted_by_errors {
+        debug!("Skipping borrowck because of tainted body");
+        Err(guar)
+    } else if input_body.should_skip() {
+        debug!("Skipping borrowck because of injected body");
+        let opaque_types = Default::default();
+        Ok(BorrowckResultWithFacts {
+            borrowck_result: tcx.arena.alloc(opaque_types),
+            bodies_with_facts: Default::default(),
+        })
+    } else {
+        let mut root_cx =
+            BorrowCheckRootCtxt::new(tcx, root_def_id, Some(BorrowckConsumer::new(options)));
+        root_cx.do_mir_borrowck();
+
+        let consumer = root_cx.consumer.take().unwrap();
+        let borrowck_result = root_cx.finalize()?;
+
+        Ok(BorrowckResultWithFacts { borrowck_result, bodies_with_facts: consumer.bodies })
+    }
 }
